@@ -3,8 +3,8 @@ import json
 import base64
 import tempfile
 from typing import Dict, Any, List
-import vertexai
-from vertexai.preview.vision_models import ImageGenerationModel
+from google import genai
+from google.genai import types
 from google.adk.tools import BaseTool, ToolContext
 from google.cloud import storage
 from google.oauth2 import service_account
@@ -17,7 +17,7 @@ load_dotenv()
 
 class ImagenTool(BaseTool):
     """
-    Custom ADK tool for generating images using Google Vertex AI Imagen.
+    Custom ADK tool for generating images using Google Vertex AI Imagen via google-genai SDK.
     Automatically stores images in GCS bucket to avoid MCP token payload issues.
     """
     
@@ -37,9 +37,13 @@ class ImagenTool(BaseTool):
         if not self._bucket_name:
             print("⚠️  Warning: GENMEDIA_BUCKET not set. Images will be returned as base64 payloads which may cause token issues.")
         
-        # Initialize Vertex AI
-        vertexai.init(project=self._project_id, location=self._location)
-        self._model = ImageGenerationModel.from_pretrained("imagegeneration@006")
+        # Initialize google-genai Client
+        self._client = genai.Client(
+            vertexai=True,
+            project=self._project_id,
+            location=self._location
+        )
+        self._model_id = "imagen-3.0-generate-001"
         
         # Initialize GCS client if bucket is configured
         self._storage_client = None
@@ -112,24 +116,28 @@ class ImagenTool(BaseTool):
             
             print(f"🎨 Generating image with prompt: {full_prompt}")
             
-            # Generate image using Vertex AI Imagen
-            response = self._model.generate_images(
+            # Generate image using google-genai
+            response = self._client.models.generate_images(
+                model=self._model_id,
                 prompt=full_prompt,
-                number_of_images=number_of_images,
-                negative_prompt=negative_prompt,
-                aspect_ratio=aspect_ratio
+                config=types.GenerateImagesConfig(
+                    number_of_images=number_of_images,
+                    negative_prompt=negative_prompt,
+                    aspect_ratio=aspect_ratio,
+                    output_mime_type="image/png"
+                )
             )
             
-            # Access the images property of the response
-            images = response.images if hasattr(response, 'images') else []
+            generated_images = response.generated_images if response.generated_images else []
             
             image_results = []
             
-            for i, image in enumerate(images):
+            for i, gen_img in enumerate(generated_images):
                 try:
                     # Save to temporary file first
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
-                        image.save(location=temp_file.name)
+                        temp_file.write(gen_img.image_bytes)
+                        temp_file.flush()
                         
                         # If bucket is configured, upload to GCS
                         if self._storage_client and self._bucket_name:
@@ -145,25 +153,23 @@ class ImagenTool(BaseTool):
                             except Exception as e:
                                 print(f"❌ Failed to upload image {i} to bucket: {e}")
                                 # Fallback to base64 if bucket upload fails
-                                with open(temp_file.name, "rb") as img_file:
-                                    img_base64 = base64.b64encode(img_file.read()).decode('utf-8')
-                                    image_results.append({
-                                        "index": i,
-                                        "base64": img_base64,
-                                        "format": "png",
-                                        "stored_in_bucket": False,
-                                        "bucket_error": str(e)
-                                    })
-                        else:
-                            # No bucket configured, return base64
-                            with open(temp_file.name, "rb") as img_file:
-                                img_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+                                img_base64 = base64.b64encode(gen_img.image_bytes).decode('utf-8')
                                 image_results.append({
                                     "index": i,
                                     "base64": img_base64,
                                     "format": "png",
-                                    "stored_in_bucket": False
+                                    "stored_in_bucket": False,
+                                    "bucket_error": str(e)
                                 })
+                        else:
+                            # No bucket configured, return base64
+                            img_base64 = base64.b64encode(gen_img.image_bytes).decode('utf-8')
+                            image_results.append({
+                                "index": i,
+                                "base64": img_base64,
+                                "format": "png",
+                                "stored_in_bucket": False
+                            })
                         
                         # Clean up temporary file
                         os.unlink(temp_file.name)
@@ -211,72 +217,74 @@ class ImagenTool(BaseTool):
         print(f"🎨 Generating {number_of_images} image(s) with prompt: {full_prompt[:100]}...")
         
         try:
-            response = self._model.generate_images(
+            response = self._client.models.generate_images(
+                model=self._model_id,
                 prompt=full_prompt,
-                number_of_images=number_of_images,
-                negative_prompt=negative_prompt,
-                aspect_ratio=aspect_ratio
+                config=types.GenerateImagesConfig(
+                    number_of_images=number_of_images,
+                    negative_prompt=negative_prompt,
+                    aspect_ratio=aspect_ratio,
+                    output_mime_type="image/png"
+                )
             )
-            # Access the images property of the response
-            images = response.images if hasattr(response, 'images') else []
-            print(f"✅ Imagen API returned {len(images)} images")
+            generated_images = response.generated_images if response.generated_images else []
+            print(f"✅ Imagen API returned {len(generated_images)} images")
         except Exception as e:
             print(f"❌ Imagen API failed: {e}")
             return []
         
-        if not images:
+        if not generated_images:
             print("⚠️ No images returned from Imagen API")
             return []
             
         results: List[Dict[str, Any]] = []
-        for i, image in enumerate(images):
-            print(f"📷 Processing image {i+1}/{len(images)}")
+        for i, gen_img in enumerate(generated_images):
+            print(f"📷 Processing image {i+1}/{len(generated_images)}")
             try:
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
-                    image.save(location=temp_file.name)
-                    print(f"💾 Saved image {i+1} to temp file: {temp_file.name}")
-                    
-                    # Always read base64 for fallback
-                    with open(temp_file.name, "rb") as img_file:
-                        img_base64 = base64.b64encode(img_file.read()).decode('utf-8')
-                    
-                    if self._storage_client and self._bucket_name:
-                        try:
-                            gcs_url = self._upload_to_bucket(temp_file.name, full_prompt, i)
-                            print(f"☁️ Uploaded image {i+1} to GCS: {gcs_url}")
-                            results.append({
-                                "index": i,
-                                "gcs_url": gcs_url,
-                                "base64": img_base64,  # Include base64 as fallback
-                                "format": "png",
-                                "stored_in_bucket": True
-                            })
-                        except Exception as e:
-                            print(f"❌ GCS upload failed for image {i+1}: {e}")
-                            results.append({
-                                "index": i,
-                                "base64": img_base64,
-                                "format": "png",
-                                "stored_in_bucket": False,
-                                "bucket_error": str(e)
-                            })
-                    else:
-                        print(f"📦 No bucket configured, using base64 for image {i+1}")
+                # Always have base64 for fallback/internal use
+                img_base64 = base64.b64encode(gen_img.image_bytes).decode('utf-8')
+                
+                if self._storage_client and self._bucket_name:
+                    try:
+                        # Save to temporary file for upload
+                        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+                            temp_file.write(gen_img.image_bytes)
+                            temp_file.flush()
+                            temp_path = temp_file.name
+                        
+                        gcs_url = self._upload_to_bucket(temp_path, full_prompt, i)
+                        print(f"☁️ Uploaded image {i+1} to GCS: {gcs_url}")
+                        results.append({
+                            "index": i,
+                            "gcs_url": gcs_url,
+                            "base64": img_base64,  # Include base64 as fallback
+                            "format": "png",
+                            "stored_in_bucket": True
+                        })
+                        os.unlink(temp_path)
+                    except Exception as e:
+                        print(f"❌ GCS upload failed for image {i+1}: {e}")
                         results.append({
                             "index": i,
                             "base64": img_base64,
                             "format": "png",
-                            "stored_in_bucket": False
+                            "stored_in_bucket": False,
+                            "bucket_error": str(e)
                         })
-                    
-                    os.unlink(temp_file.name)
-                    print(f"🗑️ Cleaned up temp file for image {i+1}")
+                else:
+                    print(f"📦 No bucket configured, using base64 for image {i+1}")
+                    results.append({
+                        "index": i,
+                        "base64": img_base64,
+                        "format": "png",
+                        "stored_in_bucket": False
+                    })
                     
             except Exception as e:
                 print(f"❌ Failed to process image {i+1}: {e}")
                 continue
                 
-        print(f"✅ Successfully processed {len(results)} out of {len(images)} images")
+        print(f"✅ Successfully processed {len(results)} out of {len(generated_images)} images")
         return results
 
     def _upload_to_bucket(self, local_path: str, prompt: str, index: int) -> str:
